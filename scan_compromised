@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# scan_compromised
+# Resolves symlinks to find the real script dir, then loads compromised.txt
+# Priorities:
+# 1) compromised.txt next to the real script file
+# 2) compromised.txt in current directory or nearest ancestor (project-level)
+# Usage: scan_compromised [--compromised-file /path/to/file]
+
+set -euo pipefail
+
+# allow overriding the list file via CLI
+if [ "${1:-}" = "--compromised-file" ] && [ -n "${2:-}" ]; then
+  COMPROMISED_FILE="$2"
+  if [ ! -f "$COMPROMISED_FILE" ]; then
+    echo "❌ Specified compromised file not found: $COMPROMISED_FILE" >&2
+    exit 2
+  fi
+else
+  # resolve real script path (works when the script is symlinked)
+  SOURCE="${BASH_SOURCE[0]}"
+  while [ -L "$SOURCE" ]; do
+    # DIR where the symlink lives
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    # follow the link
+    SOURCE="$(readlink "$SOURCE")"
+    # if link was relative, convert to absolute
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  done
+  SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+  # 1) prefer compromised.txt next to the script (real location)
+  if [ -f "$SCRIPT_DIR/compromised.txt" ]; then
+    COMPROMISED_FILE="$SCRIPT_DIR/compromised.txt"
+  else
+    # 2) search current dir -> parent -> ... for compromised.txt (project-local)
+    CUR="$(pwd)"
+    FOUND=""
+    while true; do
+      if [ -f "$CUR/compromised.txt" ]; then
+        FOUND="$CUR/compromised.txt"
+        break
+      fi
+      if [ "$CUR" = "/" ]; then
+        break
+      fi
+      CUR="$(dirname "$CUR")"
+    done
+
+    if [ -n "$FOUND" ]; then
+      COMPROMISED_FILE="$FOUND"
+    else
+      echo "❌ Missing compromised.txt file. Looked for:"
+      echo "   • next to script: $SCRIPT_DIR/compromised.txt"
+      echo "   • in current directory and parents"
+      echo
+      echo "You can place a compromised.txt next to the script or in your project folder,"
+      echo "or call: scan_compromised --compromised-file /path/to/compromised.txt"
+      exit 2
+    fi
+  fi
+fi
+
+echo "Using compromised list: $COMPROMISED_FILE"
+echo "Scanning current directory: $(pwd)"
+echo
+
+FOUND_ANY=0
+
+# choose lockfile / manifest to inspect (prefer yarn.lock, then package.json)
+LOCKFILE=""
+if [ -f "yarn.lock" ]; then
+  LOCKFILE="yarn.lock"
+elif [ -f "package-lock.json" ]; then
+  LOCKFILE="package-lock.json"
+elif [ -f "package.json" ]; then
+  LOCKFILE="package.json"
+fi
+
+while IFS= read -r raw || [ -n "$raw" ]; do
+  # skip blank lines and comments
+  pkg="$(echo "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [ -z "$pkg" ] && continue
+  case "$pkg" in \#*) continue ;; esac
+
+  echo ">>> Checking: $pkg"
+
+  # check in lockfile/manifest if available
+  found_in_lock=1
+  if [ -n "$LOCKFILE" ]; then
+    if grep -q -E "(^|\"|[:space:])${pkg}(@|:| |$)" "$LOCKFILE" 2>/dev/null; then
+      echo "  - ⚠️ Found in $LOCKFILE"
+      found_in_lock=0
+      FOUND_ANY=1
+    fi
+  else
+    found_in_lock=2  # unknown (no lockfile)
+  fi
+
+  # only run yarn why if the package was found in lockfile/manifest (or if no lockfile we try a yarn why but only if yarn exists)
+  if [ "$found_in_lock" -eq 0 ]; then
+    if command -v yarn >/dev/null 2>&1; then
+      if yarn why "$pkg" >/tmp/scan_compromised_yarn_why.$$ 2>/dev/null; then
+        echo "  - yarn why: present in dependency tree (snippet):"
+        sed -n '1,6p' /tmp/scan_compromised_yarn_why.$$ | sed 's/^/    /'
+      fi
+      rm -f /tmp/scan_compromised_yarn_why.$$ 2>/dev/null || true
+    fi
+  else
+    # not found in lockfile
+    # still do a quick node_modules check
+    if [ -d "node_modules/$pkg" ] || [ -d "node_modules/${pkg//\//@/}" ]; then
+      echo "  - ⚠️ Installed in node_modules/"
+      FOUND_ANY=1
+      if command -v yarn >/dev/null 2>&1; then
+        if yarn why "$pkg" >/tmp/scan_compromised_yarn_why.$$ 2>/dev/null; then
+          echo "  - yarn why: present in dependency tree (snippet):"
+          sed -n '1,6p' /tmp/scan_compromised_yarn_why.$$ | sed 's/^/    /'
+        fi
+        rm -f /tmp/scan_compromised_yarn_why.$$ 2>/dev/null || true
+      fi
+    else
+      echo "  - ✅ Not found in lockfile or node_modules"
+    fi
+  fi
+
+  # global checks
+  if command -v yarn >/dev/null 2>&1 && yarn global list 2>/dev/null | grep -q "$pkg"; then
+    echo "  - ⚠️ Found in yarn global"
+    FOUND_ANY=1
+  fi
+  if command -v npm >/dev/null 2>&1 && npm list -g --depth=0 2>/dev/null | grep -q "$pkg"; then
+    echo "  - ⚠️ Found in npm global"
+    FOUND_ANY=1
+  fi
+
+  echo
+done < "$COMPROMISED_FILE"
+
+if [ "$FOUND_ANY" -ne 0 ]; then
+  echo "Scan finished — one or more compromised packages were found."
+  exit 1
+else
+  echo "Scan finished — nothing found."
+  exit 0
+fi
