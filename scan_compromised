@@ -1,145 +1,268 @@
 #!/usr/bin/env bash
 # scan_compromised
-# Resolves symlinks to find the real script dir, then loads compromised.txt
-# Priorities:
-# 1) compromised.txt next to the real script file
-# 2) compromised.txt in current directory or nearest ancestor (project-level)
-# Usage: scan_compromised [--compromised-file /path/to/file]
+# Usage:
+#   scan_compromised                  # scan current project (behaviour as before)
+#   scan_compromised --compromised-file /path/to/list.txt
+#   scan_compromised --paths-file /path/to/projects.txt
+#   scan_compromised --paths-file /p.txt --compromised-file /c.txt
+#
+# paths-file: one project directory per line (absolute or relative).
+# compromised-file: one package name per line (scoped names allowed). Comments with #.
 
 set -euo pipefail
 
-# allow overriding the list file via CLI
-if [ "${1:-}" = "--compromised-file" ] && [ -n "${2:-}" ]; then
-  COMPROMISED_FILE="$2"
-  if [ ! -f "$COMPROMISED_FILE" ]; then
-    echo "❌ Specified compromised file not found: $COMPROMISED_FILE" >&2
-    exit 2
-  fi
-else
-  # resolve real script path (works when the script is symlinked)
-  SOURCE="${BASH_SOURCE[0]}"
+# ---------- helpers ----------
+err() { echo "ERROR: $*" >&2; }
+info() { echo "$*"; }
+
+# resolve script real path (follow symlinks)
+resolve_script_dir() {
+  local SOURCE="${BASH_SOURCE[0]}"
   while [ -L "$SOURCE" ]; do
-    # DIR where the symlink lives
+    local DIR
     DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
-    # follow the link
     SOURCE="$(readlink "$SOURCE")"
-    # if link was relative, convert to absolute
     [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
   done
-  SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  printf '%s' "$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+}
 
-  # 1) prefer compromised.txt next to the script (real location)
-  if [ -f "$SCRIPT_DIR/compromised.txt" ]; then
-    COMPROMISED_FILE="$SCRIPT_DIR/compromised.txt"
-  else
-    # 2) search current dir -> parent -> ... for compromised.txt (project-local)
-    CUR="$(pwd)"
-    FOUND=""
-    while true; do
-      if [ -f "$CUR/compromised.txt" ]; then
-        FOUND="$CUR/compromised.txt"
-        break
-      fi
-      if [ "$CUR" = "/" ]; then
-        break
-      fi
-      CUR="$(dirname "$CUR")"
-    done
+SCRIPT_DIR="$(resolve_script_dir)"
 
-    if [ -n "$FOUND" ]; then
-      COMPROMISED_FILE="$FOUND"
-    else
-      echo "❌ Missing compromised.txt file. Looked for:"
-      echo "   • next to script: $SCRIPT_DIR/compromised.txt"
-      echo "   • in current directory and parents"
-      echo
-      echo "You can place a compromised.txt next to the script or in your project folder,"
-      echo "or call: scan_compromised --compromised-file /path/to/compromised.txt"
+# ---------- parse args ----------
+COMPROMISED_FILE=""
+PATHS_FILE=""
+while [ "${1:-}" != "" ]; do
+  case "$1" in
+    --compromised-file)
+      shift
+      COMPROMISED_FILE="$1"
+      ;;
+    --paths-file)
+      shift
+      PATHS_FILE="$1"
+      ;;
+    --help|-h)
+      cat <<EOF
+Usage:
+  scan_compromised [--compromised-file /path/to/compromised.txt] [--paths-file /path/to/projects.txt]
+
+Behavior:
+  - If --compromised-file omitted, the script will prefer:
+      1) compromised.txt next to the real script
+      2) compromised.txt in current dir or nearest ancestor (project-local)
+  - If --paths-file provided, each non-empty, non-comment line is treated as a project directory to scan.
+  - Without --paths-file the current working directory is scanned.
+
+EOF
+      exit 0
+      ;;
+    *)
+      err "Unknown arg: $1"
       exit 2
-    fi
-  fi
-fi
+      ;;
+  esac
+  shift
+done
 
-echo "Using compromised list: $COMPROMISED_FILE"
-echo "Scanning current directory: $(pwd)"
-echo
-
-FOUND_ANY=0
-
-# choose lockfile / manifest to inspect (prefer yarn.lock, then package.json)
-LOCKFILE=""
-if [ -f "yarn.lock" ]; then
-  LOCKFILE="yarn.lock"
-elif [ -f "package-lock.json" ]; then
-  LOCKFILE="package-lock.json"
-elif [ -f "package.json" ]; then
-  LOCKFILE="package.json"
-fi
-
-while IFS= read -r raw || [ -n "$raw" ]; do
-  # skip blank lines and comments
-  pkg="$(echo "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-  [ -z "$pkg" ] && continue
-  case "$pkg" in \#*) continue ;; esac
-
-  echo ">>> Checking: $pkg"
-
-  # check in lockfile/manifest if available
-  found_in_lock=1
-  if [ -n "$LOCKFILE" ]; then
-    if grep -q -E "(^|\"|[:space:])${pkg}(@|:| |$)" "$LOCKFILE" 2>/dev/null; then
-      echo "  - ⚠️ Found in $LOCKFILE"
-      found_in_lock=0
-      FOUND_ANY=1
-    fi
-  else
-    found_in_lock=2  # unknown (no lockfile)
+# ---------- find compromised list ----------
+find_compromised_file() {
+  if [ -n "$COMPROMISED_FILE" ]; then
+    [ -f "$COMPROMISED_FILE" ] || { err "Specified compromised file not found: $COMPROMISED_FILE"; exit 2; }
+    printf '%s' "$COMPROMISED_FILE"
+    return
   fi
 
-  # only run yarn why if the package was found in lockfile/manifest (or if no lockfile we try a yarn why but only if yarn exists)
-  if [ "$found_in_lock" -eq 0 ]; then
-    if command -v yarn >/dev/null 2>&1; then
-      if yarn why "$pkg" >/tmp/scan_compromised_yarn_why.$$ 2>/dev/null; then
-        echo "  - yarn why: present in dependency tree (snippet):"
-        sed -n '1,6p' /tmp/scan_compromised_yarn_why.$$ | sed 's/^/    /'
-      fi
-      rm -f /tmp/scan_compromised_yarn_why.$$ 2>/dev/null || true
+  # 1) next to script
+  if [ -f "$SCRIPT_DIR/compromised.txt" ]; then
+    printf '%s' "$SCRIPT_DIR/compromised.txt"
+    return
+  fi
+
+  # 2) find in current dir -> parents
+  local CUR="$PWD"
+  while true; do
+    if [ -f "$CUR/compromised.txt" ]; then
+      printf '%s' "$CUR/compromised.txt"
+      return
     fi
-  else
-    # not found in lockfile
-    # still do a quick node_modules check
-    if [ -d "node_modules/$pkg" ] || [ -d "node_modules/${pkg//\//@/}" ]; then
-      echo "  - ⚠️ Installed in node_modules/"
-      FOUND_ANY=1
-      if command -v yarn >/dev/null 2>&1; then
-        if yarn why "$pkg" >/tmp/scan_compromised_yarn_why.$$ 2>/dev/null; then
-          echo "  - yarn why: present in dependency tree (snippet):"
-          sed -n '1,6p' /tmp/scan_compromised_yarn_why.$$ | sed 's/^/    /'
-        fi
-        rm -f /tmp/scan_compromised_yarn_why.$$ 2>/dev/null || true
+    [ "$CUR" = "/" ] && break
+    CUR="$(dirname "$CUR")"
+  done
+
+  err "Missing compromised.txt. Provide one next to the script, in the current project, or pass --compromised-file"
+  exit 2
+}
+
+COMP_FILE="$(find_compromised_file)"
+info "Using compromised list: $COMP_FILE"
+
+# ---------- read compromised list into array ----------
+mapfile -t COMPROMISED_PKGS < <(grep -E -v '^[[:space:]]*(#|$)' "$COMP_FILE" || true)
+if [ "${#COMPROMISED_PKGS[@]}" -eq 0 ]; then
+  err "Compromised list is empty after filtering comments/blank lines."
+  exit 2
+fi
+
+# ---------- utility to expand paths (tilde etc) ----------
+expand_path() {
+  local p="$1"
+  # use parameter expansion via eval to expand ~ and relative paths safely
+  # but avoid word-splitting
+  printf '%s' "$(cd "$(eval "printf '%s' \"$p\"")" >/dev/null 2>&1 && pwd)" 2>/dev/null || return 1
+}
+
+# ---------- scanning logic for a single project directory ----------
+# Globals used: COMPROMISED_PKGS array
+scan_one_project() {
+  local project_dir="$1"
+  local found_in_project=0
+  local orig_dir
+  orig_dir="$PWD"
+  if ! cd "$project_dir" >/dev/null 2>&1; then
+    err "Cannot enter directory: $project_dir"
+    return 1  # non-fatal, skip (return 1 = falsy = not found)
+  fi
+
+  info "---- Project: $project_dir ----"
+  # detect lockfile/manifest priority
+  local LOCKFILE=""
+  if [ -f "yarn.lock" ]; then
+    LOCKFILE="yarn.lock"
+  elif [ -f "package-lock.json" ]; then
+    LOCKFILE="package-lock.json"
+  elif [ -f "pnpm-lock.yaml" ]; then
+    LOCKFILE="pnpm-lock.yaml"
+  elif [ -f "package.json" ]; then
+    LOCKFILE="package.json"
+  fi
+
+  info "  Scanning files: ${LOCKFILE:-'(no lockfile/package.json found)'}"
+
+  # iterate pkgs
+  for raw in "${COMPROMISED_PKGS[@]}"; do
+    pkg="$raw"
+    # basic sanitize / trim (should be fine already)
+    pkg="$(echo "$pkg" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$pkg" ] && continue
+
+    printf "  › %-30s" "$pkg"
+
+    local reported=0
+
+    # check lockfile/manifest
+    if [ -n "$LOCKFILE" ]; then
+      # Escape special regex characters in package name, but preserve / for scoped packages
+      pkg_escaped=$(printf '%s\n' "$pkg" | sed 's/[.[\*^$+?{|()]/\\&/g')
+      if grep -q -E "(^|\"|[[:space:]])${pkg_escaped}(@|:|[[:space:]]|$)" "$LOCKFILE" 2>/dev/null; then
+        printf " FOUND in %s\n" "$LOCKFILE"
+        reported=1
+        found_in_project=1
+      else
+        printf " not-in-lockfile"
       fi
     else
-      echo "  - ✅ Not found in lockfile or node_modules"
+      printf " (no-lockfile)"
     fi
+
+    # quick node_modules check
+    # Note: node_modules/$pkg works for both regular packages (node_modules/pkg) 
+    # and scoped packages (node_modules/@scope/pkg)
+    if [ -d "node_modules/$pkg" ]; then
+      printf ", installed"
+      reported=1
+      found_in_project=1
+    fi
+
+    # run yarn why ONLY if package seems present (found in lockfile or node_modules) and yarn exists
+    if [ "$reported" -eq 1 ] && command -v yarn >/dev/null 2>&1; then
+      # use temp file
+      TMPY="/tmp/scan_compromised_yarn_$$"
+      if yarn why "$pkg" >"$TMPY" 2>/dev/null; then
+        printf ", yarn-why OK\n"
+        sed -n '1,3p' "$TMPY" | sed 's/^/      /'
+      else
+        printf ", yarn-why no-info\n"
+      fi
+      rm -f "$TMPY" >/dev/null 2>&1 || true
+    else
+      printf "\n"
+    fi
+  done
+
+  # global checks (only when scanning the filesystem of the current user - best-effort)
+  # show if any compromised pkg found in this project
+  if [ "$found_in_project" -ne 0 ]; then
+    info "  -> Compromised package(s) FOUND in project: $project_dir"
+  else
+    info "  -> No compromised packages found in project."
   fi
 
-  # global checks
-  if command -v yarn >/dev/null 2>&1 && yarn global list 2>/dev/null | grep -q "$pkg"; then
-    echo "  - ⚠️ Found in yarn global"
-    FOUND_ANY=1
-  fi
-  if command -v npm >/dev/null 2>&1 && npm list -g --depth=0 2>/dev/null | grep -q "$pkg"; then
-    echo "  - ⚠️ Found in npm global"
-    FOUND_ANY=1
+  cd "$orig_dir" >/dev/null 2>&1 || true
+  # Return 0 (success/truthy) if found, 1 (failure/falsy) if not found
+  # This way the if statement correctly detects when packages were found
+  return $((found_in_project == 0 ? 1 : 0))
+}
+
+# ---------- run scanning across a list of paths or single project ----------
+ANY_FOUND=0
+
+if [ -n "$PATHS_FILE" ]; then
+  if [ ! -f "$PATHS_FILE" ]; then
+    err "Paths file not found: $PATHS_FILE"
+    exit 2
   fi
 
-  echo
-done < "$COMPROMISED_FILE"
+  # iterate paths file (ignore blanks and comments)
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    path="$(echo "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$path" ] && continue
+    [[ "$path" =~ ^# ]] && continue
 
-if [ "$FOUND_ANY" -ne 0 ]; then
-  echo "Scan finished — one or more compromised packages were found."
+    # expand ~ and relative references
+    # allow relative paths (relative to CWD) — expand_path attempts to make absolute
+    if [[ "$path" = /* ]]; then
+      abs="$path"
+    else
+      abs="$(pwd)/$path"
+    fi
+
+    # try to normalize
+    if real_abs="$(cd "$abs" >/dev/null 2>&1 && pwd)"; then
+      abs="$real_abs"
+    else
+      # try to expand ~ if present
+      if [[ "$path" = ~* ]]; then
+        expanded="${path/#\~/$HOME}"
+        if real_abs="$(cd "$expanded" >/dev/null 2>&1 && pwd)"; then
+          abs="$real_abs"
+        else
+          err "Skipping unreadable path: $path"
+          continue
+        fi
+      else
+        err "Skipping unreadable path: $path"
+        continue
+      fi
+    fi
+
+    if scan_one_project "$abs"; then
+      ANY_FOUND=1
+    fi
+    echo
+  done < "$PATHS_FILE"
+else
+  # single-directory mode: current directory
+  if scan_one_project "$(pwd)"; then
+    ANY_FOUND=1
+  fi
+fi
+
+# final exit code
+if [ "$ANY_FOUND" -ne 0 ]; then
+  info "==> One or more compromised packages were found in scanned projects."
   exit 1
 else
-  echo "Scan finished — nothing found."
+  info "==> No compromised packages found in scanned projects."
   exit 0
 fi
