@@ -112,9 +112,84 @@ expand_path() {
   printf '%s' "$(cd "$(eval "printf '%s' \"$p\"")" >/dev/null 2>&1 && pwd)" 2>/dev/null || return 1
 }
 
+# ---------- data collection for summary ----------
+# Use temp file to store findings (format: TYPE|PROJECT|PACKAGE|FILE|DETAILS)
+SUMMARY_FILE="/tmp/scan_compromised_summary_$$"
+touch "$SUMMARY_FILE"
+
+# Function to record a finding
+record_finding() {
+  local type="$1"      # "COMPROMISED" or "HTTP_URL"
+  local project="$2"
+  local package="$3"
+  local file="$4"
+  local details="$5"   # Additional details (e.g., dependency type, parent, URL)
+  printf "%s|%s|%s|%s|%s\n" "$type" "$project" "$package" "$file" "$details" >> "$SUMMARY_FILE"
+}
+
+# Function to check if a package is a direct dependency
+is_direct_dependency() {
+  local pkg="$1"
+  if [ -f "package.json" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      # Check all dependency sections
+      if jq -e ".dependencies.\"$pkg\" // .devDependencies.\"$pkg\" // .peerDependencies.\"$pkg\" // .optionalDependencies.\"$pkg\"" package.json >/dev/null 2>&1; then
+        return 0
+      fi
+    else
+      # Fallback: use grep
+      if grep -q -E "\"$pkg\"[[:space:]]*:" package.json 2>/dev/null; then
+        return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
+# Function to get parent dependency (best effort)
+get_parent_dependency() {
+  local pkg="$1"
+  local parent=""
+  
+  # Try yarn why first
+  if command -v yarn >/dev/null 2>&1 && [ -f "yarn.lock" ]; then
+    local tmpy="/tmp/scan_compromised_parent_$$"
+    if yarn why "$pkg" >"$tmpy" 2>/dev/null; then
+      # Extract parent from yarn why output (look for "=>" patterns)
+      parent=$(grep -E "=>|Reasons:" "$tmpy" 2>/dev/null | head -1 | sed 's/.*=>[[:space:]]*//' | sed 's/[[:space:]]*$//' | head -c 50)
+      rm -f "$tmpy" >/dev/null 2>&1 || true
+      [ -n "$parent" ] && printf "%s" "$parent" && return 0
+    fi
+    rm -f "$tmpy" >/dev/null 2>&1 || true
+  fi
+  
+  # Try npm ls
+  if command -v npm >/dev/null 2>&1 && [ -f "package-lock.json" ]; then
+    local tmpn="/tmp/scan_compromised_parent_$$"
+    if npm ls "$pkg" --depth=0 >"$tmpn" 2>&1; then
+      # npm ls shows the dependency tree
+      parent=$(grep -E "^[├└]" "$tmpn" 2>/dev/null | grep -v "$pkg" | head -1 | sed 's/[├└│─ ]//g' | sed 's/@.*$//' | head -c 50)
+      rm -f "$tmpn" >/dev/null 2>&1 || true
+      [ -n "$parent" ] && printf "%s" "$parent" && return 0
+    fi
+    rm -f "$tmpn" >/dev/null 2>&1 || true
+  fi
+  
+  # Fallback: try to parse lockfile
+  if [ -f "package-lock.json" ] && command -v jq >/dev/null 2>&1; then
+    # This is complex - just return "transitive" as indicator
+    printf "transitive"
+    return 0
+  fi
+  
+  return 1
+}
+
 # ---------- check for HTTP URLs in dependencies ----------
 # Returns 0 if URLs found, 1 if not found
+# Records findings to SUMMARY_FILE via record_finding
 check_http_urls_in_dependencies() {
+  local project_dir="$1"
   local http_urls_found=0
 
   # Check package.json for HTTP URLs in dependencies
@@ -134,6 +209,7 @@ check_http_urls_in_dependencies() {
             http_urls_found=1
           fi
           info "      - $pkg_name: $pkg_version (in package.json)"
+          record_finding "HTTP_URL" "$project_dir" "$pkg_name" "package.json" "$pkg_version"
         fi
       done <<< "$deps_json"
     else
@@ -151,8 +227,10 @@ check_http_urls_in_dependencies() {
           # Pattern: "package-name": "http://..."
           if [[ "$line" =~ \"([^\"]+)\":[[:space:]]*\"(http[s]?://[^\"]+)\" ]]; then
             info "      - ${BASH_REMATCH[1]}: ${BASH_REMATCH[2]} (in package.json)"
+            record_finding "HTTP_URL" "$project_dir" "${BASH_REMATCH[1]}" "package.json" "${BASH_REMATCH[2]}"
           else
             info "      - $line (in package.json)"
+            record_finding "HTTP_URL" "$project_dir" "unknown" "package.json" "$line"
           fi
         done <<< "$url_matches"
       fi
@@ -193,6 +271,7 @@ check_http_urls_in_dependencies() {
             pkg_name="${BASH_REMATCH[1]}"
           fi
           info "      - $pkg_name: $url (in package-lock.json)"
+          record_finding "HTTP_URL" "$project_dir" "$pkg_name" "package-lock.json" "$url"
         done <<< "$pkg_urls"
       fi
     else
@@ -209,6 +288,7 @@ check_http_urls_in_dependencies() {
           if [[ "$line" =~ \"(resolved|version)\":[[:space:]]*\"(http[s]?://[^\"]+)\" ]]; then
             local url="${BASH_REMATCH[2]}"
             info "      - HTTP URL in package-lock.json: $url"
+            record_finding "HTTP_URL" "$project_dir" "unknown" "package-lock.json" "$url"
           fi
         done <<< "$lockfile_urls"
       fi
@@ -234,8 +314,10 @@ check_http_urls_in_dependencies() {
           local url="${BASH_REMATCH[1]}"
           if [ -n "$current_pkg" ]; then
             info "      - $current_pkg: $url (in yarn.lock)"
+            record_finding "HTTP_URL" "$project_dir" "$current_pkg" "yarn.lock" "$url"
           else
             info "      - HTTP URL in yarn.lock: $url"
+            record_finding "HTTP_URL" "$project_dir" "unknown" "yarn.lock" "$url"
           fi
         fi
       done <<< "$yarn_urls"
@@ -261,8 +343,10 @@ check_http_urls_in_dependencies() {
           local url="${BASH_REMATCH[2]}"
           if [ -n "$current_pkg" ]; then
             info "      - $current_pkg: $url (in pnpm-lock.yaml)"
+            record_finding "HTTP_URL" "$project_dir" "$current_pkg" "pnpm-lock.yaml" "$url"
           else
             info "      - HTTP URL in pnpm-lock.yaml: $url"
+            record_finding "HTTP_URL" "$project_dir" "unknown" "pnpm-lock.yaml" "$url"
           fi
         fi
       done <<< "$pnpm_urls"
@@ -298,6 +382,7 @@ check_http_urls_in_dependencies() {
                 http_urls_found=1
               fi
               info "      - $dep_name: $dep_version (in $pkg_name/package.json)"
+              record_finding "HTTP_URL" "$project_dir" "$dep_name" "$pkg_file" "$dep_version"
             fi
           done <<< "$deps_json"
         else
@@ -312,6 +397,7 @@ check_http_urls_in_dependencies() {
             while IFS= read -r line; do
               if [[ "$line" =~ \"([^\"]+)\":[[:space:]]*\"(http[s]?://[^\"]+)\" ]]; then
                 info "      - ${BASH_REMATCH[1]}: ${BASH_REMATCH[2]} (in $pkg_name/package.json)"
+                record_finding "HTTP_URL" "$project_dir" "${BASH_REMATCH[1]}" "$pkg_file" "${BASH_REMATCH[2]}"
               fi
             done <<< "$url_matches"
           fi
@@ -356,7 +442,7 @@ scan_one_project() {
   info "  Scanning files: ${LOCKFILE:-'(no lockfile/package.json found)'}"
 
   # check for HTTP URLs in dependencies
-  if check_http_urls_in_dependencies; then
+  if check_http_urls_in_dependencies "$project_dir"; then
     found_in_project=1
   fi
 
@@ -372,11 +458,16 @@ scan_one_project() {
     local reported=0
 
     # check lockfile/manifest
+    local files_found=""
+    local dep_type=""
+    local parent_info=""
+    
     if [ -n "$LOCKFILE" ]; then
       # Escape special regex characters in package name, but preserve / for scoped packages
       pkg_escaped=$(printf '%s\n' "$pkg" | sed 's/[.[\*^$+?{|()]/\\&/g')
       if grep -q -E "(^|\"|[[:space:]])${pkg_escaped}(@|:|[[:space:]]|$)" "$LOCKFILE" 2>/dev/null; then
         printf " FOUND in %s\n" "$LOCKFILE"
+        files_found="$LOCKFILE"
         reported=1
         found_in_project=1
       else
@@ -391,8 +482,28 @@ scan_one_project() {
     # and scoped packages (node_modules/@scope/pkg)
     if [ -d "node_modules/$pkg" ]; then
       printf ", installed"
+      [ -n "$files_found" ] && files_found="$files_found,node_modules/$pkg" || files_found="node_modules/$pkg"
       reported=1
       found_in_project=1
+    fi
+    
+    # Determine if it's a direct or transitive dependency
+    if [ "$reported" -eq 1 ]; then
+      if is_direct_dependency "$pkg"; then
+        dep_type="direct"
+        # Add package.json to files if it's a direct dependency
+        [ -f "package.json" ] && {
+          [ -n "$files_found" ] && files_found="$files_found,package.json" || files_found="package.json"
+        }
+      else
+        dep_type="transitive"
+        parent_info=$(get_parent_dependency "$pkg" 2>/dev/null || echo "")
+      fi
+      
+      # Record the finding with all details
+      local details="${dep_type}"
+      [ -n "$parent_info" ] && details="${details}|parent:${parent_info}"
+      record_finding "COMPROMISED" "$project_dir" "$pkg" "$files_found" "$details"
     fi
 
     # run yarn why ONLY if package seems present (found in lockfile or node_modules) and yarn exists
@@ -479,11 +590,98 @@ else
   fi
 fi
 
-# final exit code
+# ---------- output summary ----------
+output_summary() {
+  if [ ! -s "$SUMMARY_FILE" ]; then
+    return 0
+  fi
+  
+  # Generate report filename with timestamp
+  local timestamp
+  timestamp=$(date +"%Y%m%d_%H%M%S" 2>/dev/null || date +"%Y%m%d_%H%M%S")
+  local report_file
+  # Use absolute path based on current working directory
+  report_file="$(pwd)/npm_compromised_report_${timestamp}.txt"
+  
+  # Write summary to report file
+  {
+    echo "════════════════════════════════════════════════════════════════"
+    echo "NPM COMPROMISED PACKAGES SCAN REPORT"
+    echo "Generated: $(date)"
+    echo "════════════════════════════════════════════════════════════════"
+    echo
+    echo "SUMMARY: Affected Files and Dependencies"
+    echo
+    echo "════════════════════════════════════════════════════════════════"
+    echo
+    
+    # Group by project
+    local current_project=""
+    
+    # Sort by project, then by type, then by package
+    sort -t'|' -k2,2 -k1,1 -k3,3 "$SUMMARY_FILE" | while IFS='|' read -r type project package file details; do
+      if [ "$project" != "$current_project" ]; then
+        [ -n "$current_project" ] && echo
+        echo "📁 Project: $project"
+        current_project="$project"
+      fi
+      
+      if [ "$type" = "COMPROMISED" ]; then
+        # Parse details: dep_type|parent:parent_name
+        local dep_type="${details%%|*}"
+        local parent_info=""
+        if [[ "$details" =~ parent: ]]; then
+          parent_info="${details#*parent:}"
+        fi
+        
+        echo "  ⚠️  COMPROMISED: $package"
+        echo "      Type: $dep_type dependency"
+        [ -n "$parent_info" ] && [ "$parent_info" != "transitive" ] && echo "      Introduced by: $parent_info"
+        # Format files list (comma-separated to multi-line if needed)
+        if [[ "$file" =~ , ]]; then
+          echo "      Files:"
+          echo "$file" | tr ',' '\n' | sed 's/^/        - /'
+        else
+          echo "      File: $file"
+        fi
+        echo "      Action: Remove from affected files and run 'npm install' or equivalent"
+        
+      elif [ "$type" = "HTTP_URL" ]; then
+        echo "  🔓 HTTP URL: $package"
+        echo "      URL: $details"
+        echo "      File: $file"
+        echo "      Action: Replace HTTP URL with HTTPS or registry version in $file"
+      fi
+      echo
+    done
+    
+    # Count and display total projects affected
+    local project_count
+    project_count=$(cut -d'|' -f2 "$SUMMARY_FILE" | sort -u | wc -l | tr -d ' ')
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Total projects affected: $project_count"
+    echo "════════════════════════════════════════════════════════════════"
+  } > "$report_file"
+  
+  # Return the report file path
+  printf "%s" "$report_file"
+}
+
+# Output summary if any findings
 if [ "$ANY_FOUND" -ne 0 ]; then
-  info "==> One or more compromised packages were found in scanned projects."
+  REPORT_FILE=$(output_summary)
+  if [ -n "$REPORT_FILE" ] && [ -f "$REPORT_FILE" ]; then
+    info ""
+    info "==> One or more compromised packages were found in scanned projects."
+    info "==> Detailed report saved to: $REPORT_FILE"
+  else
+    info ""
+    info "==> One or more compromised packages were found in scanned projects."
+  fi
+  rm -f "$SUMMARY_FILE" >/dev/null 2>&1 || true
   exit 1
 else
   info "==> No compromised packages found in scanned projects."
+  rm -f "$SUMMARY_FILE" >/dev/null 2>&1 || true
   exit 0
 fi
