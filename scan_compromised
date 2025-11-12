@@ -185,6 +185,50 @@ get_parent_dependency() {
   return 1
 }
 
+# Function to check if a package is in the compromised list
+# Takes package name and extracts base name (handles scoped packages and version strings)
+is_compromised_package() {
+  local pkg="$1"
+  local pkg_base
+  
+  # Extract base package name
+  # Examples:
+  #   "pkg@1.0.0" -> "pkg"
+  #   "@scope/pkg@1.0.0" -> "@scope/pkg"
+  #   "@scope/pkg" -> "@scope/pkg"
+  #   "pkg" -> "pkg"
+  
+  if [[ "$pkg" =~ ^@ ]]; then
+    # Scoped package: @scope/pkg or @scope/pkg@version
+    # Remove version part if present (everything after last @ that looks like a version)
+    # For "@scope/pkg@1.0.0", we want "@scope/pkg"
+    # Check if there's a @ followed by a digit at the end (version pattern)
+    if echo "$pkg" | grep -qE '@[0-9][^@]*$'; then
+      # Has version: remove @ followed by version pattern from the end
+      pkg_base=$(echo "$pkg" | sed -E 's/@[0-9][^@]*$//')
+    else
+      # No version: use as-is
+      pkg_base="$pkg"
+    fi
+  else
+    # Regular package: pkg or pkg@version
+    # Remove @version if present
+    pkg_base="${pkg%%@*}"
+  fi
+  
+  # Check if base name is in compromised list
+  local compromised
+  for compromised in "${COMPROMISED_PKGS[@]}"; do
+    compromised="$(echo "$compromised" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$compromised" ] && continue
+    if [ "$pkg_base" = "$compromised" ]; then
+      return 0
+    fi
+  done
+  
+  return 1
+}
+
 # ---------- check for HTTP URLs in dependencies ----------
 # Returns 0 if URLs found, 1 if not found
 # Records findings to SUMMARY_FILE via record_finding
@@ -204,12 +248,15 @@ check_http_urls_in_dependencies() {
       
       while IFS='|' read -r pkg_name pkg_version; do
         if [[ "$pkg_version" =~ ^(http|https):// ]]; then
-          if [ "$http_urls_found" -eq 0 ]; then
-            info "  ⚠️  HTTP/HTTPS URLs found in dependencies:"
-            http_urls_found=1
+          # Only flag if the package is in the compromised list
+          if is_compromised_package "$pkg_name"; then
+            if [ "$http_urls_found" -eq 0 ]; then
+              info "  ⚠️  HTTP/HTTPS URLs found for compromised packages:"
+              http_urls_found=1
+            fi
+            info "      - $pkg_name: $pkg_version (in package.json)"
+            record_finding "HTTP_URL" "$project_dir" "$pkg_name" "package.json" "$pkg_version"
           fi
-          info "      - $pkg_name: $pkg_version (in package.json)"
-          record_finding "HTTP_URL" "$project_dir" "$pkg_name" "package.json" "$pkg_version"
         fi
       done <<< "$deps_json"
     else
@@ -218,19 +265,21 @@ check_http_urls_in_dependencies() {
       local url_matches
       url_matches=$(grep -E '"(http|https)://[^"]*"' package.json 2>/dev/null || true)
       if [ -n "$url_matches" ]; then
-        if [ "$http_urls_found" -eq 0 ]; then
-          info "  ⚠️  HTTP/HTTPS URLs found in dependencies:"
-          http_urls_found=1
-        fi
         while IFS= read -r line; do
           # Extract package name and URL from the line
           # Pattern: "package-name": "http://..."
           if [[ "$line" =~ \"([^\"]+)\":[[:space:]]*\"(http[s]?://[^\"]+)\" ]]; then
-            info "      - ${BASH_REMATCH[1]}: ${BASH_REMATCH[2]} (in package.json)"
-            record_finding "HTTP_URL" "$project_dir" "${BASH_REMATCH[1]}" "package.json" "${BASH_REMATCH[2]}"
-          else
-            info "      - $line (in package.json)"
-            record_finding "HTTP_URL" "$project_dir" "unknown" "package.json" "$line"
+            local pkg_name="${BASH_REMATCH[1]}"
+            local url="${BASH_REMATCH[2]}"
+            # Only flag if the package is in the compromised list
+            if is_compromised_package "$pkg_name"; then
+              if [ "$http_urls_found" -eq 0 ]; then
+                info "  ⚠️  HTTP/HTTPS URLs found for compromised packages:"
+                http_urls_found=1
+              fi
+              info "      - $pkg_name: $url (in package.json)"
+              record_finding "HTTP_URL" "$project_dir" "$pkg_name" "package.json" "$url"
+            fi
           fi
         done <<< "$url_matches"
       fi
@@ -260,38 +309,25 @@ check_http_urls_in_dependencies() {
       ' package-lock.json 2>/dev/null || true)
       
       if [ -n "$pkg_urls" ]; then
-        if [ "$http_urls_found" -eq 0 ]; then
-          info "  ⚠️  HTTP/HTTPS URLs found in dependencies:"
-          http_urls_found=1
-        fi
         while IFS='|' read -r pkg_path url; do
           # Extract package name from path (e.g., "node_modules/@scope/pkg" -> "@scope/pkg")
           local pkg_name="${pkg_path##*/}"
           if [ "$pkg_path" != "$pkg_name" ] && [[ "$pkg_path" =~ node_modules/(.+) ]]; then
             pkg_name="${BASH_REMATCH[1]}"
           fi
-          info "      - $pkg_name: $url (in package-lock.json)"
-          record_finding "HTTP_URL" "$project_dir" "$pkg_name" "package-lock.json" "$url"
+          # Only flag if the package is in the compromised list
+          if is_compromised_package "$pkg_name"; then
+            if [ "$http_urls_found" -eq 0 ]; then
+              info "  ⚠️  HTTP/HTTPS URLs found for compromised packages:"
+              http_urls_found=1
+            fi
+            info "      - $pkg_name: $url (in package-lock.json)"
+            record_finding "HTTP_URL" "$project_dir" "$pkg_name" "package-lock.json" "$url"
+          fi
         done <<< "$pkg_urls"
       fi
-    else
-      # Fallback: use grep to find HTTP URLs
-      local lockfile_urls
-      lockfile_urls=$(grep -E '"(resolved|version)":\s*"(http|https)://[^"]*"' package-lock.json 2>/dev/null || true)
-      if [ -n "$lockfile_urls" ]; then
-        if [ "$http_urls_found" -eq 0 ]; then
-          info "  ⚠️  HTTP/HTTPS URLs found in dependencies:"
-          http_urls_found=1
-        fi
-        while IFS= read -r line; do
-          # Try to extract URL
-          if [[ "$line" =~ \"(resolved|version)\":[[:space:]]*\"(http[s]?://[^\"]+)\" ]]; then
-            local url="${BASH_REMATCH[2]}"
-            info "      - HTTP URL in package-lock.json: $url"
-            record_finding "HTTP_URL" "$project_dir" "unknown" "package-lock.json" "$url"
-          fi
-        done <<< "$lockfile_urls"
-      fi
+      # Note: Without jq, we can't easily extract package names from package-lock.json,
+      # so we skip the fallback grep check as we can't verify if the package is compromised
     fi
   elif [ -f "yarn.lock" ]; then
     # Check yarn.lock for HTTP URLs
@@ -300,10 +336,6 @@ check_http_urls_in_dependencies() {
     local yarn_urls
     yarn_urls=$(grep -B 5 -E 'resolved\s+"(http|https)://[^"]*"' yarn.lock 2>/dev/null | grep -E '^"[^"]+@[^"]+":|resolved\s+"(http|https)://' || true)
     if [ -n "$yarn_urls" ]; then
-      if [ "$http_urls_found" -eq 0 ]; then
-        info "  ⚠️  HTTP/HTTPS URLs found in dependencies:"
-        http_urls_found=1
-      fi
       local current_pkg=""
       while IFS= read -r line; do
         # Extract package name from line like: "package-name@version:"
@@ -313,11 +345,15 @@ check_http_urls_in_dependencies() {
         elif [[ "$line" =~ resolved[[:space:]]+\"(http[s]?://[^\"]+)\" ]]; then
           local url="${BASH_REMATCH[1]}"
           if [ -n "$current_pkg" ]; then
-            info "      - $current_pkg: $url (in yarn.lock)"
-            record_finding "HTTP_URL" "$project_dir" "$current_pkg" "yarn.lock" "$url"
-          else
-            info "      - HTTP URL in yarn.lock: $url"
-            record_finding "HTTP_URL" "$project_dir" "unknown" "yarn.lock" "$url"
+            # Only flag if the package is in the compromised list
+            if is_compromised_package "$current_pkg"; then
+              if [ "$http_urls_found" -eq 0 ]; then
+                info "  ⚠️  HTTP/HTTPS URLs found for compromised packages:"
+                http_urls_found=1
+              fi
+              info "      - $current_pkg: $url (in yarn.lock)"
+              record_finding "HTTP_URL" "$project_dir" "$current_pkg" "yarn.lock" "$url"
+            fi
           fi
         fi
       done <<< "$yarn_urls"
@@ -329,10 +365,6 @@ check_http_urls_in_dependencies() {
     local pnpm_urls
     pnpm_urls=$(grep -B 3 -E '(resolution|tarball):\s*(http|https)://' pnpm-lock.yaml 2>/dev/null | grep -E '^[[:space:]]*/[^:]+:|(resolution|tarball):\s*(http|https)://' || true)
     if [ -n "$pnpm_urls" ]; then
-      if [ "$http_urls_found" -eq 0 ]; then
-        info "  ⚠️  HTTP/HTTPS URLs found in dependencies:"
-        http_urls_found=1
-      fi
       local current_pkg=""
       while IFS= read -r line; do
         # Extract package path from line like: "  /package-name/version:"
@@ -342,11 +374,15 @@ check_http_urls_in_dependencies() {
         elif [[ "$line" =~ (resolution|tarball):[[:space:]]*(http[s]?://[^[:space:]]+) ]]; then
           local url="${BASH_REMATCH[2]}"
           if [ -n "$current_pkg" ]; then
-            info "      - $current_pkg: $url (in pnpm-lock.yaml)"
-            record_finding "HTTP_URL" "$project_dir" "$current_pkg" "pnpm-lock.yaml" "$url"
-          else
-            info "      - HTTP URL in pnpm-lock.yaml: $url"
-            record_finding "HTTP_URL" "$project_dir" "unknown" "pnpm-lock.yaml" "$url"
+            # Only flag if the package is in the compromised list
+            if is_compromised_package "$current_pkg"; then
+              if [ "$http_urls_found" -eq 0 ]; then
+                info "  ⚠️  HTTP/HTTPS URLs found for compromised packages:"
+                http_urls_found=1
+              fi
+              info "      - $current_pkg: $url (in pnpm-lock.yaml)"
+              record_finding "HTTP_URL" "$project_dir" "$current_pkg" "pnpm-lock.yaml" "$url"
+            fi
           fi
         fi
       done <<< "$pnpm_urls"
@@ -359,10 +395,19 @@ check_http_urls_in_dependencies() {
     local node_modules_pkgs
     # Find all package.json files in node_modules
     # We check all of them to catch HTTP URLs in any nested dependency's package.json
+    info "  Scanning node_modules for HTTP URLs (this may take a while)..."
     node_modules_pkgs=$(find node_modules -name "package.json" -type f 2>/dev/null || true)
     
     if [ -n "$node_modules_pkgs" ]; then
+      local nm_count=0
+      local nm_total
+      nm_total=$(echo "$node_modules_pkgs" | wc -l | tr -d ' ')
       while IFS= read -r pkg_file; do
+        nm_count=$((nm_count + 1))
+        # Show progress every 100 packages or at milestones
+        if [ $((nm_count % 100)) -eq 0 ] || [ "$nm_count" -eq "$nm_total" ]; then
+          printf "\r  Scanning node_modules: %d/%d packages checked..." "$nm_count" "$nm_total" >&2
+        fi
         # Extract package name from path (e.g., "node_modules/@scope/pkg/package.json" -> "@scope/pkg")
         local pkg_path="${pkg_file%/*}"
         local pkg_name="${pkg_path##*/}"
@@ -377,12 +422,15 @@ check_http_urls_in_dependencies() {
           
           while IFS='|' read -r dep_name dep_version; do
             if [[ "$dep_version" =~ ^(http|https):// ]]; then
-              if [ "$http_urls_found" -eq 0 ]; then
-                info "  ⚠️  HTTP/HTTPS URLs found in dependencies:"
-                http_urls_found=1
+              # Only flag if the dependency is in the compromised list
+              if is_compromised_package "$dep_name"; then
+                if [ "$http_urls_found" -eq 0 ]; then
+                  info "  ⚠️  HTTP/HTTPS URLs found for compromised packages:"
+                  http_urls_found=1
+                fi
+                info "      - $dep_name: $dep_version (in $pkg_name/package.json)"
+                record_finding "HTTP_URL" "$project_dir" "$dep_name" "$pkg_file" "$dep_version"
               fi
-              info "      - $dep_name: $dep_version (in $pkg_name/package.json)"
-              record_finding "HTTP_URL" "$project_dir" "$dep_name" "$pkg_file" "$dep_version"
             fi
           done <<< "$deps_json"
         else
@@ -390,24 +438,31 @@ check_http_urls_in_dependencies() {
           local url_matches
           url_matches=$(grep -E '"(http|https)://[^"]*"' "$pkg_file" 2>/dev/null || true)
           if [ -n "$url_matches" ]; then
-            if [ "$http_urls_found" -eq 0 ]; then
-              info "  ⚠️  HTTP/HTTPS URLs found in dependencies:"
-              http_urls_found=1
-            fi
             while IFS= read -r line; do
               if [[ "$line" =~ \"([^\"]+)\":[[:space:]]*\"(http[s]?://[^\"]+)\" ]]; then
-                info "      - ${BASH_REMATCH[1]}: ${BASH_REMATCH[2]} (in $pkg_name/package.json)"
-                record_finding "HTTP_URL" "$project_dir" "${BASH_REMATCH[1]}" "$pkg_file" "${BASH_REMATCH[2]}"
+                local dep_name="${BASH_REMATCH[1]}"
+                local url="${BASH_REMATCH[2]}"
+                # Only flag if the dependency is in the compromised list
+                if is_compromised_package "$dep_name"; then
+                  if [ "$http_urls_found" -eq 0 ]; then
+                    info "  ⚠️  HTTP/HTTPS URLs found for compromised packages:"
+                    http_urls_found=1
+                  fi
+                  info "      - $dep_name: $url (in $pkg_name/package.json)"
+                  record_finding "HTTP_URL" "$project_dir" "$dep_name" "$pkg_file" "$url"
+                fi
               fi
             done <<< "$url_matches"
           fi
         fi
       done <<< "$node_modules_pkgs"
+      # Clear progress line and add newline
+      printf "\r  Scanning node_modules: %d/%d packages checked. Done.\n" "$nm_count" "$nm_total" >&2
     fi
   fi
 
   if [ "$http_urls_found" -eq 0 ]; then
-    info "  ✓ No HTTP/HTTPS URLs found in dependencies"
+    info "  ✓ No HTTP/HTTPS URLs found for compromised packages"
     return 1
   else
     return 0
@@ -440,20 +495,30 @@ scan_one_project() {
   fi
 
   info "  Scanning files: ${LOCKFILE:-'(no lockfile/package.json found)'}"
+  info "  Checking ${#COMPROMISED_PKGS[@]} compromised packages..."
 
   # check for HTTP URLs in dependencies
+  info "  Checking for HTTP URLs in dependencies..."
   if check_http_urls_in_dependencies "$project_dir"; then
     found_in_project=1
   fi
 
   # iterate pkgs
+  local pkg_count=0
+  local total_pkgs=${#COMPROMISED_PKGS[@]}
   for raw in "${COMPROMISED_PKGS[@]}"; do
     pkg="$raw"
     # basic sanitize / trim (should be fine already)
     pkg="$(echo "$pkg" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     [ -z "$pkg" ] && continue
-
-    printf "  › %-30s" "$pkg"
+    
+    pkg_count=$((pkg_count + 1))
+    # Show progress every 10 packages or for the first few
+    if [ "$pkg_count" -le 3 ] || [ $((pkg_count % 10)) -eq 0 ] || [ "$pkg_count" -eq "$total_pkgs" ]; then
+      printf "  [%3d/%3d] Checking: %-30s" "$pkg_count" "$total_pkgs" "$pkg"
+    else
+      printf "  [%3d/%3d] %-30s" "$pkg_count" "$total_pkgs" "$pkg"
+    fi
 
     local reported=0
 
@@ -497,7 +562,11 @@ scan_one_project() {
         }
       else
         dep_type="transitive"
+        # Show progress for parent dependency check (can be slow)
+        printf " (checking parent...)" >&2
         parent_info=$(get_parent_dependency "$pkg" 2>/dev/null || echo "")
+        # Clear the progress message
+        printf "\r" >&2
       fi
       
       # Record the finding with all details
@@ -510,10 +579,27 @@ scan_one_project() {
     if [ "$reported" -eq 1 ] && command -v yarn >/dev/null 2>&1; then
       # use temp file
       TMPY="/tmp/scan_compromised_yarn_$$"
-      if yarn why "$pkg" >"$TMPY" 2>/dev/null; then
+      printf " (yarn why...)" >&2
+      # Use timeout if available, otherwise run directly
+      if command -v timeout >/dev/null 2>&1; then
+        if timeout 5 yarn why "$pkg" >"$TMPY" 2>/dev/null; then
+          yarn_success=1
+        else
+          yarn_success=0
+        fi
+      else
+        if yarn why "$pkg" >"$TMPY" 2>/dev/null; then
+          yarn_success=1
+        else
+          yarn_success=0
+        fi
+      fi
+      if [ "$yarn_success" -eq 1 ]; then
+        printf "\r" >&2
         printf ", yarn-why OK\n"
         sed -n '1,3p' "$TMPY" | sed 's/^/      /'
       else
+        printf "\r" >&2
         printf ", yarn-why no-info\n"
       fi
       rm -f "$TMPY" >/dev/null 2>&1 || true
